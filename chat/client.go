@@ -1,8 +1,8 @@
 package chat
 
 import (
-	"net/http"
-	"strconv"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"ims/std"
@@ -33,24 +33,103 @@ var (
 	space   = []byte{' '}
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
+// Client wrap websocket client
+//
+type Client struct {
+	id  uint64 // client id
+	ids string // client id string
+	//room string          // room id
+	hub  *RoomHub        // room hub
+	msgs std.Queue       // message queue
+	conn *websocket.Conn // websocket connection
+	quit chan struct{}
 }
 
-type Client struct {
-	id   uint64
-	hub  *Hub
-	conn *websocket.Conn
-	send std.Queue
+// NewClient create an new client instance
+func NewClient(hub *RoomHub, conn *websocket.Conn) *Client {
+	c := &Client{
+		id:   std.GenUniqueID(),
+		hub:  hub,
+		conn: conn,
+		msgs: std.NewSyncQueue(maxQueueSize),
+		quit: make(chan struct{}, 2),
+	}
+	c.ids = fmt.Sprintf("%d", c.id)
+
+	// handler websocket read/write client in seperate goroutine
+	go c.readPump()
+	go c.writePump()
+	return c
+}
+
+// PushMessage push message to client
+func (c *Client) PushMessage(msg *Message) bool {
+	return c.msgs.Add(msg)
+}
+
+// OnMessage handle client message
+func (c *Client) OnMessage(msg *Message) {
+	switch msg.Type {
+	case T_MESSAGE:
+		clog.Trace("client %s send message: %v.", c.ids, msg.Data)
+		if msg.Room == "" {
+			msg.Data = "no room specified"
+			c.PushMessage(msg)
+		} else {
+			c.hub.Broadcast(msg)
+		}
+
+	case T_ROOMS:
+		reply := &Message{Type: T_ROOMS}
+		clog.Trace("client %s get room list", c.ids)
+		if res := c.hub.RoomList(); res != nil {
+			if bs, err := json.Marshal(res); err == nil {
+				reply.Data = string(bs)
+				reply.From = c.ids
+			} else {
+				clog.Error(2, "marshal rooms (%v) failed: %v.", res, err)
+			}
+		}
+		c.PushMessage(reply)
+
+	case T_JOIN:
+		reply := &Message{Type: T_JOIN}
+		clog.Trace("client %s join room %s", c.ids, msg.Room)
+		if c.hub.JoinRoom(c, msg.Room) {
+			reply.Data = msg.Room
+		}
+		c.PushMessage(reply)
+
+	case T_LEAVE:
+		reply := &Message{Type: T_LEAVE}
+		clog.Trace("client %s leave room %s", c.ids, msg.Room)
+		if c.hub.LeaveRoom(c, msg.Room) {
+			reply.Data = msg.Room
+		}
+		c.PushMessage(reply)
+
+	case T_CREATE:
+		reply := &Message{Type: T_CREATE}
+		clog.Trace("client %s create room %s", c.ids, msg.Data)
+		if rm := c.hub.NewRoom(msg.Data); rm != nil {
+			if bs, err := json.Marshal(rm); err == nil {
+				reply.Data = string(bs)
+			} else {
+				clog.Error(2, "marshal room %+v failed: %v.", rm, err)
+			}
+		}
+		c.PushMessage(reply)
+
+	default:
+		clog.Trace("unknown message type %v from client %s.", msg.Type, c.ids)
+	}
 }
 
 func (c *Client) readPump() {
 	defer func() {
-		c.hub.offline <- c
-		c.send.Close()
 		c.conn.Close()
-		clog.Info("Client %d read routine end.", c.id)
+		close(c.quit)
+		clog.Info("client %d read routine end.", c.id)
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
@@ -71,12 +150,14 @@ func (c *Client) readPump() {
 			return
 		}
 
-		msg.ID = c.id
-		msg.From = strconv.FormatUint(c.id, 10)
+		msg.From = c.ids
 		msg.Timestamp = std.GetNowMs()
+		if c.hub.OnMessage(&msg); msg.Discard {
+			clog.Info("discard cleint %s message %v.", c.id, msg)
+			continue
+		}
 
-		c.hub.broadcast.Add(&msg)
-		clog.Trace("receive client %v message: %v.", c.id, msg.Content)
+		c.OnMessage(&msg)
 	}
 }
 
@@ -84,19 +165,21 @@ func (c *Client) writePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		c.send.Close()
+		c.msgs.Close()
 		c.conn.Close()
 		clog.Info("client %d write routine end.", c.id)
 	}()
 
-	var err error
-	var msg *Message
-	chMsg := c.send.Cout()
+	var (
+		err   error
+		msg   *Message
+		chMsg = c.msgs.Cout()
+	)
 
 	for {
 		select {
 		case v, ok := <-chMsg:
-			if !ok && c.hub.broadcast.Closed() {
+			if !ok && c.hub.IsClosed() {
 				clog.Warn("websocket server closed.")
 				return
 			}
@@ -115,33 +198,11 @@ func (c *Client) writePump() {
 				}
 				return
 			}
-			clog.Trace("send message %v to client %v.", msg.Content, c.id)
+			if msg.Type == T_CLOSE {
+				return
+			}
 
-			/*
-				w, err := c.conn.NextWriter(websocket.TextMessage)
-
-				if err != nil {
-					if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-						clog.Error(2, "client %d writer error: %v", c.id, err)
-					} else {
-						clog.Trace("client %v closed.", c.id)
-					}
-					return
-				}
-
-				c.conn.WriteJSON
-
-				msg, _ := item.(*Message)
-				data, _ := json.Marshal(msg)
-				w.Write(data)
-
-				if err := w.Close(); err != nil {
-					clog.Error(2, "client %v write message error: %v", c.id, err)
-					return
-				}
-				clog.Trace("send message %v to client %v.", msg.Content, c.id)
-			*/
-
+			clog.Trace("send message %+v to client %v.", msg.Data, c.id)
 			break
 
 		case <-ticker.C:
@@ -153,32 +214,13 @@ func (c *Client) writePump() {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 					clog.Error(2, "client %d heartbeat error: %v", c.id, err)
 				} else {
-					clog.Trace("client %v closed.", c.id)
+					clog.Trace("client %v heartbeat closed.", c.id)
 				}
 				return
 			}
+
+		case <-c.quit:
+			return
 		}
 	}
-}
-
-func serveChartHandler(hub *Hub, w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		clog.Error(2, "websocket chat connection error: %v", err)
-		return
-	}
-
-	c := &Client{
-		id:   std.GenUniqueID(),
-		hub:  hub,
-		conn: conn,
-		send: std.NewSyncQueue(maxQueueSize),
-	}
-
-	hub.online <- c
-	clog.Info("New websocket client %d", c.id)
-
-	// handler websocket read/write client in seperate goroutine
-	go c.readPump()
-	go c.writePump()
 }

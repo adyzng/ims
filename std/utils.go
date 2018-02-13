@@ -3,6 +3,8 @@ package std
 import (
 	"sync/atomic"
 	"time"
+
+	uuid "github.com/satori/go.uuid"
 )
 
 var (
@@ -12,6 +14,12 @@ var (
 // GenUniqueID generate unique id
 func GenUniqueID() uint64 {
 	return atomic.AddUint64(&nextUID, 1)
+}
+
+// GenUIDs generate unique id string
+func GenUIDs() string {
+	id := uuid.Must(uuid.NewV4())
+	return id.String()
 }
 
 // GetNowMs return UTC time since 1/1/1970 in Millisecond
