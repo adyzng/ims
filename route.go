@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-clog/clog"
 	"github.com/gorilla/mux"
-	clog "gopkg.in/clog.v1"
 )
 
 // ResponseLogger is a middleware used to keep an copy of Response.StatusCode.
